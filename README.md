@@ -8,7 +8,7 @@ Sistema completo para geração automática de relatórios mensais de vendas e c
 
 - ✅ Geração automatizada de relatórios em JSON  
 - ✅ Identificação de produtos com estoque baixo  
-- ✅ Execução de jobs com AWS Batch (Fargate)  
+- ✅ Execução de jobs com AWS Batch 
 - ✅ Containerização com Docker & Docker Compose  
 - ✅ Infraestrutura como código com Terraform  
 - ✅ Logs e métricas via AWS CloudWatch  
