@@ -1,0 +1,255 @@
+name: Deploy Vendas Automation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Executa todo dia 1° do mês às 9h
+    - cron: '0 9 1 * *'
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Forçar execução do relatório'
+        required: false
+        default: 'false'
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  LOCALSTACK_ENDPOINT: http://localhost:4566
+
+jobs:
+  setup-infrastructure:
+    runs-on: ubuntu-latest
+    
+    services:
+      localstack:
+        image: localstack/localstack:latest
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: batch,ecr,ecs,iam,kms,logs,cloudwatch
+          DEBUG: 1
+        options: >-
+          --health-cmd="curl -f http://localhost:4566/_localstack/health || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: vendas_db
+          MYSQL_USER: admin
+          MYSQL_PASSWORD: senha123
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        pip install -r docker/requirements.txt
+        pip install awscli-local
+
+    - name: Wait for services
+      run: |
+        echo "Aguardando LocalStack estar pronto..."
+        for i in {1..30}; do
+          if curl -f http://localhost:4566/_localstack/health; then
+            echo "LocalStack está pronto!"
+            break
+          fi
+          echo "Tentativa $i/30... aguardando 10s"
+          sleep 10
+        done
+        
+        echo "Aguardando MySQL estar pronto..."
+        for i in {1..30}; do
+          if mysqladmin ping -h localhost -u admin -psenha123 2>/dev/null; then
+            echo "MySQL está pronto!"
+            break
+          fi
+          echo "Tentativa $i/30... aguardando 5s"
+          sleep 5
+        done
+
+    - name: Initialize database
+      run: |
+        mysql -h localhost -u admin -psenha123 vendas_db < sql/init.sql
+        mysql -h localhost -u admin -psenha123 vendas_db < sql/sample_data.sql
+        echo "Banco de dados inicializado com sucesso!"
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.0
+
+    - name: Terraform Init
+      working-directory: infrastructure/terraform
+      run: terraform init
+
+    - name: Terraform Plan
+      working-directory: infrastructure/terraform
+      run: terraform plan -out=tfplan
+
+    - name: Terraform Apply
+      working-directory: infrastructure/terraform
+      run: terraform apply -auto-approve tfplan
+
+    - name: Build Docker image
+      run: |
+        # Obter URL do ECR
+        ECR_URL=$(awslocal ecr describe-repositories --repository-names vendas-app --query 'repositories[0].repositoryUri' --output text)
+        echo "ECR_URL=$ECR_URL" >> $GITHUB_ENV
+        
+        # Build da imagem
+        docker build -t vendas-app:latest -f docker/Dockerfile .
+        docker tag vendas-app:latest $ECR_URL:latest
+        
+        # Push para ECR (LocalStack não precisa de login)
+        docker push $ECR_URL:latest
+        
+        echo "Imagem enviada para ECR: $ECR_URL:latest"
+
+    - name: Run Batch Job
+      env:
+        MYSQL_HOST: localhost
+        MYSQL_PORT: 3306
+        MYSQL_DATABASE: vendas_db
+        MYSQL_USER: admin
+        MYSQL_PASSWORD: senha123
+      run: |
+        # Submeter job
+        JOB_ID=$(awslocal batch submit-job \
+          --job-name "vendas-relatorio-$(date +%Y%m%d-%H%M%S)" \
+          --job-queue vendas-job-queue \
+          --job-definition vendas-job-def \
+          --query 'jobId' --output text)
+        
+        echo "Job submetido com ID: $JOB_ID"
+        echo "JOB_ID=$JOB_ID" >> $GITHUB_ENV
+        
+        # Aguardar conclusão do job
+        echo "Aguardando conclusão do job..."
+        for i in {1..60}; do
+          STATUS=$(awslocal batch describe-jobs --jobs $JOB_ID --query 'jobs[0].status' --output text)
+          echo "Status do job: $STATUS"
+          
+          if [ "$STATUS" = "SUCCEEDED" ]; then
+            echo "Job concluído com sucesso!"
+            break
+          elif [ "$STATUS" = "FAILED" ]; then
+            echo "Job falhou!"
+            awslocal batch describe-jobs --jobs $JOB_ID
+            exit 1
+          fi
+          
+          sleep 10
+        done
+
+    - name: Get job logs
+      run: |
+        # Obter logs do CloudWatch
+        echo "Obtendo logs do job..."
+        awslocal logs describe-log-streams \
+          --log-group-name "/aws/batch/vendas-job" \
+          --order-by LastEventTime \
+          --descending \
+          --max-items 1 \
+          --query 'logStreams[0].logStreamName' \
+          --output text > log_stream.txt
+        
+        if [ -s log_stream.txt ]; then
+          LOG_STREAM=$(cat log_stream.txt)
+          echo "Stream de log: $LOG_STREAM"
+          
+          awslocal logs get-log-events \
+            --log-group-name "/aws/batch/vendas-job" \
+            --log-stream-name "$LOG_STREAM" \
+            --query 'events[*].message' \
+            --output text
+        fi
+
+    - name: Run local test
+      env:
+        MYSQL_HOST: localhost
+        MYSQL_PORT: 3306
+        MYSQL_DATABASE: vendas_db
+        MYSQL_USER: admin
+        MYSQL_PASSWORD: senha123
+        LOCALSTACK_ENDPOINT: http://localhost:4566
+      run: |
+        echo "Executando teste local da aplicação..."
+        cd scripts && python app.py
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: relatorio-vendas
+        path: |
+          /tmp/relatorio_vendas.json
+          /tmp/vendas_app.log
+        retention-days: 30
+
+  notify-results:
+    needs: setup-infrastructure
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: relatorio-vendas
+        path: ./artifacts
+
+    - name: Summary results
+      run: |
+        echo "## 📊 Resultados do Relatório de Vendas" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f "./artifacts/relatorio_vendas.json" ]; then
+          echo "✅ Relatório gerado com sucesso!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Extrair informações principais do relatório
+          RECEITA=$(cat ./artifacts/relatorio_vendas.json | jq -r '.balanco_mensal.receita_total // 0')
+          VENDAS=$(cat ./artifacts/relatorio_vendas.json | jq -r '.balanco_mensal.total_vendas // 0')
+          ESTOQUE_BAIXO=$(cat ./artifacts/relatorio_vendas.json | jq -r '.produtos_estoque_baixo | length')
+          
+          echo "### 💰 Resumo Executivo" >> $GITHUB_STEP_SUMMARY
+          echo "- **Receita Total**: R$ $RECEITA" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total de Vendas**: $VENDAS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Produtos com Estoque Baixo**: $ESTOQUE_BAIXO" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Alertas
+          ALERTAS=$(cat ./artifacts/relatorio_vendas.json | jq -r '.alertas | length')
+          if [ "$ALERTAS" -gt 0 ]; then
+            echo "### 🚨 Alertas ($ALERTAS)" >> $GITHUB_STEP_SUMMARY
+            cat ./artifacts/relatorio_vendas.json | jq -r '.alertas[] | "- **\(.tipo)**: \(.mensagem)"' >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "❌ Erro na geração do relatório" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Data de execução**: $(date)" >> $GITHUB_STEP_SUMMARY

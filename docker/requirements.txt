@@ -1,0 +1,6 @@
+boto3==1.26.137
+mysql-connector-python==8.0.33
+pandas==2.0.2
+python-dotenv==1.0.0
+requests==2.31.0
+pytz==2023.3

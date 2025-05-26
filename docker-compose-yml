@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: localstack-vendas
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=batch,ecr,ecs,iam,kms,logs,cloudwatch
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./localstack_data:/tmp/localstack/data
+    networks:
+      - vendas-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-vendas
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: vendas_db
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: senha123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d
+    networks:
+      - vendas-network
+
+volumes:
+  mysql_data:
+
+networks:
+  vendas-network:
+    driver: bridge
